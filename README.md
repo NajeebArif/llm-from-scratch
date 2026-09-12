@@ -78,7 +78,7 @@ That will make the concepts line up beautifully with your existing Java/software
 - Install with other PyTorch packages: `uv add torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121`
 
 
-### Usage of `nn_visualization.py`
+### Usage of `nn_visualization_old.py`
 
 Yes. I went ahead and redesigned the module rather than just patching the existing functions.
 
@@ -86,10 +86,10 @@ The original file had several things that would prevent it from being genuinely 
 
 ### What I changed
 
-The new `nn_visualization.py` is designed around a **single facade**:
+The new `nn_visualization_old.py` is designed around a **single facade**:
 
 ```python
-from nn_visualization import visualize_nn
+from nn_visualization_old import visualize_nn
 
 visualize_nn(model, X)
 ```
@@ -302,7 +302,7 @@ you'll be able to see an actual neuron performing that calculation.
 
 ## Download the new module
 
-[Download `nn_visualization.py`](sandbox:/mnt/data/nn_visualization.py)
+[Download `nn_visualization_old.py`](sandbox:/mnt/data/nn_visualization.py)
 
 Put it directly in your project root:
 
@@ -324,7 +324,7 @@ llm-from-scratch/
 Then from your notebook:
 
 ```python
-from nn_visualization import visualize_nn
+from nn_visualization_old import visualize_nn
 ```
 
 and start with simply:
@@ -336,3 +336,142 @@ visualize_nn(model, X)
 **One caveat:** this version intentionally uses **PyTorch + Matplotlib**, but does **not** require `torchviz` or the Graphviz `dot.exe` installation that was causing your original problem. It also doesn't add another visualization framework just for the sake of it.
 
 I would use this as the foundation and then, as you encounter CNNs, embeddings, attention, transformers, etc. in the book, we can extend the same facade with specialized visualizations rather than replacing it.
+
+
+---------
+
+Done. I modified the module into a **teaching/debug version**, rather than just a network-inspection utility.
+
+### Download the updated module
+
+[Download `nn_visualization.py`](sandbox:/mnt/data/nn_visualization.py)
+
+I also validated that the new module imports correctly, captures the forward pass, and successfully generates/saves the animation HTML.
+
+### The new API
+
+Your existing code still works:
+
+```python
+from nn_visualization import visualize_nn
+
+visualize_nn(model, X)
+```
+
+For the learning mode you asked for:
+
+```python
+visualize_nn(model, X, debug=True)
+```
+
+This now gives you a guided walkthrough like:
+
+```text
+Step 0 — Input
+       ↓
+Step 1 — Linear 50 → 30
+       ↓
+Step 2 — ReLU 30
+       ↓
+Step 3 — Linear 30 → 20
+       ↓
+Step 4 — ReLU 20
+       ↓
+Step 5 — Linear 20 → 3
+       ↓
+Final output
+```
+
+For every step, it explains **what the layer is doing, why it is doing it, the tensor shapes, and actual values from your `X`**.
+
+For a `Linear` layer, it even drills into **one actual neuron**:
+
+```text
+x[0] × w[0]
+x[1] × w[1]
+x[2] × w[2]
+...
+x[49] × w[49]
+       ↓
+sum
+       +
+bias
+       ↓
+pre-activation z
+```
+
+and connects that to:
+
+$$
+z = xW^T + b
+$$
+
+For ReLU, it explains which actual values were negative and therefore became zero.
+
+### Animation
+
+You can now explicitly request it:
+
+```python
+visualize_nn(
+    model,
+    X,
+    debug=True,
+    animation=True
+)
+```
+
+Or save everything:
+
+```python
+result = visualize_nn(
+    model,
+    X,
+    debug=True,
+    animation=True,
+    save=True
+)
+```
+
+The generated assets go under:
+
+```text
+assets/
+└── nn_visualizations/
+```
+
+relative to the notebook's current working directory.
+
+The returned object also tells you exactly where they went:
+
+```python
+result["assets"]
+```
+
+and:
+
+```python
+result["asset_dir"]
+```
+
+The animation is saved as an `.html` file and is also displayed directly in Jupyter.
+
+### One important design choice
+
+I **didn't make `debug=True` automatically generate the animation**. Animation can be relatively large and slow, so:
+
+```python
+visualize_nn(model, X, debug=True)
+```
+
+means **"teach me the forward pass."**
+
+Whereas:
+
+```python
+visualize_nn(model, X, debug=True, animation=True, save=True)
+```
+
+means **"teach me everything and create the reusable assets."**
+
+I think this is a much better fit for your current stage in *Build a Large Language Model from Scratch*: you're not just trying to inspect a neural network—you want to build the intuition for **what PyTorch is actually doing mathematically**.
