@@ -1115,6 +1115,431 @@ def print_network_summary(
     print("=" * 78)
 
 
+
+# ---------------------------------------------------------------------------
+# Teaching / debug explanations
+# ---------------------------------------------------------------------------
+
+def _display_markdown(text: str) -> None:
+    """Display Markdown in Jupyter, or fall back to plain text elsewhere."""
+    try:
+        from IPython.display import Markdown, display
+        display(Markdown(text))
+    except ImportError:
+        # Strip the most common Markdown markers for terminal users.
+        plain = text.replace("**", "").replace("`", "")
+        print(plain)
+
+
+def _shape_text(value: torch.Tensor | None) -> str:
+    if value is None:
+        return "unknown"
+    return str(tuple(value.shape))
+
+
+def _module_role(module: nn.Module) -> str:
+    if isinstance(module, nn.Linear):
+        return "Linear layer"
+    if isinstance(module, nn.ReLU):
+        return "ReLU activation"
+    if isinstance(module, nn.Sigmoid):
+        return "Sigmoid activation"
+    if isinstance(module, nn.Tanh):
+        return "Tanh activation"
+    return module.__class__.__name__
+
+
+def _debug_layer_explanation(
+    index: int,
+    entry: TraceEntry,
+    before: torch.Tensor,
+    after: torch.Tensor | None,
+    *,
+    max_values: int = 12,
+) -> None:
+    """Explain one actual forward-pass step using the captured tensors."""
+    module = entry.module
+    role = _module_role(module)
+    name = entry.name or role
+    before_shape = _shape_text(before)
+    after_shape = _shape_text(after)
+
+    _display_markdown(
+        f"""
+### Step {index}: `{name}` — {role}
+
+The **output of the previous step becomes the input to this step**.
+
+- Input tensor shape: `{before_shape}`
+- Output tensor shape: `{after_shape}`
+"""
+    )
+
+    if isinstance(module, nn.Linear):
+        _display_markdown(
+            f"""
+**What this layer is doing**
+
+This is a fully connected layer with **{module.in_features} input features**
+and **{module.out_features} neurons**.
+
+Each neuron receives **all {module.in_features} input values** and computes:
+
+\\[
+z_j = \\sum_i x_i w_{{j,i}} + b_j
+\\]
+
+In matrix form, PyTorch performs:
+
+\\[
+z = xW^T + b
+\\]
+
+So the transformation is:
+
+`{module.in_features} values → {module.out_features} values`
+
+The values below are the **actual values produced by this forward pass**.
+"""
+        )
+
+        sample_in = before.detach().reshape(-1)
+        sample_out = after.detach().reshape(-1) if after is not None else None
+
+        if sample_in.numel() > 0 and module.out_features > 0:
+            neuron_idx = min(0, module.out_features - 1)
+            weights = module.weight.detach()[neuron_idx]
+            bias = (
+                float(module.bias.detach()[neuron_idx])
+                if module.bias is not None
+                else 0.0
+            )
+            products = sample_in * weights
+
+            limit = min(max_values, sample_in.numel())
+            terms = []
+            for i in range(limit):
+                terms.append(
+                    f"`x[{i}] × w[{i}]` = "
+                    f"`{_format_number(float(sample_in[i]))} × "
+                    f"{_format_number(float(weights[i]))}` = "
+                    f"`{_format_number(float(products[i]))}`"
+                )
+            if sample_in.numel() > limit:
+                terms.append(f"*… {sample_in.numel() - limit} more terms …*")
+
+            weighted_sum = float(products.sum())
+            preactivation = weighted_sum + bias
+            actual_output = (
+                float(sample_out[neuron_idx])
+                if sample_out is not None and sample_out.numel() > neuron_idx
+                else None
+            )
+
+            _display_markdown(
+                f"""
+#### Inside neuron 0
+
+Let's zoom into **one neuron**. This is the most important idea to understand
+what a `Linear` layer actually does.
+
+{"  \n".join(terms)}
+
+Then:
+
+- Sum of weighted inputs = `{_format_number(weighted_sum)}`
+- Bias = `{_format_number(bias)}`
+- Pre-activation `z` = `{_format_number(preactivation)}`
+- Neuron output = `{_format_number(actual_output) if actual_output is not None else "unknown"}`
+
+So one neuron is simply a **weighted sum of the inputs plus a bias**.
+The layer repeats this calculation for every neuron.
+"""
+            )
+
+    elif isinstance(module, nn.ReLU):
+        _display_markdown(
+            """
+**What this layer is doing**
+
+ReLU applies:
+
+\\[
+\\operatorname{ReLU}(z) = \\max(0,z)
+\\]
+
+It does something very simple:
+
+- negative values become `0`
+- positive values stay unchanged
+
+This gives the network a **non-linear transformation**. Without non-linear
+activations such as ReLU, stacking Linear layers would still be equivalent to
+one larger Linear transformation.
+"""
+        )
+
+        before_values = before.detach().reshape(-1)
+        after_values = after.detach().reshape(-1) if after is not None else None
+        if after_values is not None:
+            negative = int((before_values < 0).sum().item())
+            zero = int((after_values == 0).sum().item())
+            positive = int((before_values > 0).sum().item())
+            _display_markdown(
+                f"""
+**What happened to this actual sample?**
+
+- Values entering ReLU: `{before_values.numel()}`
+- Negative values removed: **{negative}**
+- Positive values passed through: **{positive}**
+- Zeros after ReLU: **{zero}**
+
+So ReLU changed the representation from:
+
+`{before_shape} → {after_shape}`
+
+while replacing negative activations with zero.
+"""
+            )
+
+    else:
+        _display_markdown(
+            f"""
+This module is `{module.__class__.__name__}`. The visualizer captured its
+actual input and output tensors so you can see how the representation changes
+during the forward pass.
+"""
+        )
+
+
+def _debug_figure_explanation(kind: str, model: nn.Module, X: torch.Tensor,
+                               traces: Sequence[TraceEntry]) -> None:
+    """Explain the meaning of each visualization before it is displayed."""
+    linear_count = sum(isinstance(t.module, nn.Linear) for t in traces)
+    relu_count = sum(isinstance(t.module, nn.ReLU) for t in traces)
+
+    explanations = {
+        "architecture": f"""
+### Visualization: Network architecture
+
+This image is the **map of the neural network**. It answers:
+
+> *What components does the model contain, and how are they connected?*
+
+It is not showing the calculation for one particular neuron. Instead, it
+shows the structure discovered directly from the PyTorch model.
+
+For this model, the visualizer found **{len(traces)} executable layers/modules**,
+including **{linear_count} Linear layer(s)** and **{relu_count} ReLU activation(s)**.
+
+The important thing to notice is that the size changes as information moves
+through the network. A layer's output size becomes the next layer's input size.
+""",
+        "data_flow": """
+### Visualization: How one input sample travels through the network
+
+This image follows **one sample from `X`** through the forward pass.
+
+Each stage represents the actual tensor produced by a module. Therefore, this
+is not a hypothetical diagram: it is based on the values captured while
+PyTorch executed `model(X)`.
+
+Think of it as a pipeline:
+
+`input → transformation → activation → transformation → activation → output`
+
+The purpose is to make the tensor-shape changes and representation changes
+visible.
+""",
+        "activations": """
+### Visualization: Activation statistics across the network
+
+This image summarizes the values produced at each module.
+
+An **activation** is simply the value produced by a neuron/module during a
+forward pass. Statistics such as minimum, maximum, mean and standard
+deviation help us understand the numerical range of those values.
+
+For ReLU layers, the percentage of zero values is especially useful: it tells
+us how many neurons were inactive for this particular input.
+
+This graph is therefore answering:
+
+> *What kind of numbers are flowing through the network?*
+""",
+        "weights": """
+### Visualization: Learned weights
+
+A Linear layer contains a weight matrix. Each row corresponds to one output
+neuron, and each column corresponds to one input feature.
+
+The image shows those learned parameters rather than the values flowing
+through the network.
+
+Remember the distinction:
+
+- **weights** = parameters learned by the model
+- **activations** = values produced when a particular input is processed
+""",
+        "relu": """
+### Visualization: ReLU behavior
+
+This image focuses specifically on the ReLU transformation.
+
+It lets you compare values **before** and **after** ReLU so you can see which
+values were passed through and which negative values became zero.
+""",
+        "neuron": """
+### Visualization: Inside one neuron
+
+This image zooms into a single neuron of a Linear layer.
+
+The neuron calculates:
+
+`weighted inputs → sum → + bias → pre-activation`
+
+This is the concrete numerical version of:
+
+`z = xWᵀ + b`
+
+It is the best visualization to use when connecting the mathematics in the
+book with what PyTorch is actually executing.
+""",
+        "animation": """
+### Animation: Watch the representation move
+
+The animation shows the same forward pass one stage at a time.
+
+It is useful for developing an intuition that the neural network is not
+magically producing an answer in one operation. The representation is
+repeatedly transformed:
+
+`input → Linear → ReLU → Linear → ReLU → output`
+
+The animation is saved as an HTML file when `save=True`, so it can be opened
+again later without rerunning the model.
+""",
+    }
+
+    _display_markdown(explanations.get(kind, ""))
+
+
+def _debug_walkthrough(
+    model: nn.Module,
+    X: torch.Tensor,
+    traces: Sequence[TraceEntry],
+    *,
+    max_values: int,
+) -> None:
+    """Display a guided, step-by-step forward-pass lesson."""
+    _display_markdown(
+        f"""
+# Neural network walkthrough
+
+We are going to follow **one sample** through `{model.__class__.__name__}`.
+
+Your supplied input has shape **`{tuple(X.shape)}`**.
+
+The key idea is:
+
+> A neural network repeatedly takes a tensor, transforms it, and passes the
+> resulting tensor to the next layer.
+
+We will inspect each actual transformation performed during this forward pass.
+"""
+    )
+
+    sample = X[0] if X.ndim > 1 else X
+    flat = sample.detach().reshape(-1)
+    preview = ", ".join(_format_number(float(v)) for v in flat[:max_values])
+    if flat.numel() > max_values:
+        preview += f", … ({flat.numel() - max_values} more values)"
+
+    _display_markdown(
+        f"""
+## Step 0: Input
+
+We start with **one sample** containing `{flat.numel()}` value(s).
+
+Example values from this sample:
+
+`[{preview}]`
+
+This tensor is the starting representation. Nothing has been learned or
+changed yet — it is simply the data being given to the model.
+"""
+    )
+
+    previous = X
+    for index, entry in enumerate(traces, start=1):
+        _debug_layer_explanation(
+            index,
+            entry,
+            previous,
+            entry.output,
+            max_values=max_values,
+        )
+        previous = entry.output if entry.output is not None else previous
+
+    final = traces[-1].output if traces and traces[-1].output is not None else None
+    if final is not None:
+        values = final.detach().reshape(-1)
+        preview = ", ".join(_format_number(float(v)) for v in values[:max_values])
+        if values.numel() > max_values:
+            preview += f", … ({values.numel() - max_values} more values)"
+
+        _display_markdown(
+            f"""
+## Final output
+
+The final layer produced:
+
+`[{preview}]`
+
+Shape: **`{tuple(final.shape)}`**
+
+This is the end of the forward pass. What these numbers *mean* depends on
+the task and the training setup. For a classification model, for example,
+they might later be interpreted as scores or logits.
+
+### The complete journey
+
+`{tuple(X.shape)}` → {" → ".join(_shape_text(t.output) for t in traces if t.output is not None)}
+
+The most important mental model is:
+
+**output of one module = input to the next module.**
+"""
+        )
+
+
+def _animation_explanation_only() -> None:
+    _display_markdown(
+        """
+### Animation controls
+
+The animation is an interactive visual version of the forward-pass journey.
+It is deliberately separate from the static figures because animation can be
+larger and slower to generate.
+
+Use:
+
+```python
+visualize_nn(model, X, animation=True)
+```
+
+or:
+
+```python
+visualize_nn(model, X, show="animation", save=True)
+```
+
+When `save=True`, the HTML animation is written below the configured asset
+directory.
+"""
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main facade
 # ---------------------------------------------------------------------------
@@ -1124,6 +1549,7 @@ def visualize_nn(
     X: torch.Tensor,
     *,
     show: str | Sequence[str] = "default",
+    debug: bool = False,
     architecture: bool | None = None,
     data_flow: bool | None = None,
     activations: bool | None = None,
@@ -1142,54 +1568,41 @@ def visualize_nn(
     print_summary: bool = True,
 ) -> dict[str, Any]:
     """
-    Facade for all visualizations.
+    Main teaching/debug facade for PyTorch neural-network visualization.
+
+    Normal mode:
+        visualize_nn(model, X)
+
+    Teaching mode:
+        visualize_nn(model, X, debug=True)
+
+    Teaching mode + animation + saved assets:
+        visualize_nn(model, X, debug=True, animation=True, save=True)
 
     Parameters
     ----------
-    model:
-        Any torch.nn.Module.
-
-    X:
-        Example input tensor. For a batch, the first sample is visualized.
+    debug:
+        If True, display a guided explanation before every visualization and
+        walk through the actual forward pass module by module. This is intended
+        as a learning mode, not merely a debugging flag.
 
     show:
-        "default" -> architecture + data flow + activation statistics.
-        "all" -> every visualization that applies to the model.
-        A string such as "architecture".
-        A sequence such as ["architecture", "weights"].
-
-        Supported names:
-            architecture
-            data_flow
-            activations
-            weights
-            relu
-            neuron
-            animation
-
-    The boolean flags are optional convenience aliases. If supplied they are
-    merged with `show`. For example:
-
-        visualize_nn(model, X, show="default", weights=True)
+        "default" -> architecture + data_flow + activations.
+        "all" -> all applicable static visualizations + animation.
+        A single visualization name or a sequence of names.
 
     save:
-        Save generated figures/assets under `asset_dir`.
+        If True, save figures and animation HTML under asset_dir.
 
     asset_dir:
-        Directory relative to the notebook's current working directory unless
-        an absolute path is supplied.
+        Asset directory. Relative paths are resolved from the notebook's
+        current working directory.
 
     Returns
     -------
     dict
-        {
-            "summary": ...,
-            "final_output": tensor,
-            "traces": [...],
-            "figures": {...},
-            "animations": {...},
-            "assets": [...]
-        }
+        Contains summary, final_output, traces, figures, animations, and
+        generated asset paths.
     """
     if not isinstance(model, nn.Module):
         raise TypeError("model must be a torch.nn.Module.")
@@ -1198,30 +1611,18 @@ def visualize_nn(
 
     if max_neurons < 1:
         raise ValueError("max_neurons must be >= 1.")
-
     if max_values < 1:
         raise ValueError("max_values must be >= 1.")
-
     if animation_interval < 50:
         raise ValueError("animation_interval must be >= 50 ms.")
 
-    # Resolve requested visualizations.
     if isinstance(show, str):
         if show == "default":
-            requested = {
-                "architecture",
-                "data_flow",
-                "activations",
-            }
+            requested = {"architecture", "data_flow", "activations"}
         elif show == "all":
             requested = {
-                "architecture",
-                "data_flow",
-                "activations",
-                "weights",
-                "relu",
-                "neuron",
-                "animation",
+                "architecture", "data_flow", "activations",
+                "weights", "relu", "neuron", "animation",
             }
         else:
             requested = {show}
@@ -1252,6 +1653,8 @@ def visualize_nn(
             f"Valid options: {sorted(valid)}"
         )
 
+    # Capture the actual forward pass once. Hooks are removed even if the
+    # model raises an exception.
     final_output, traces = _capture_forward(model, X)
 
     result: dict[str, Any] = {
@@ -1261,6 +1664,8 @@ def visualize_nn(
         "figures": {},
         "animations": {},
         "assets": [],
+        "asset_dir": str(Path(asset_dir).resolve()),
+        "debug": debug,
     }
 
     if print_summary:
@@ -1268,121 +1673,89 @@ def visualize_nn(
 
     prefix = prefix or model.__class__.__name__.lower()
 
-    # Architecture
-    if "architecture" in requested:
-        fig = _architecture_figure(
+    # In teaching mode, explain the complete forward pass first.
+    if debug:
+        _debug_walkthrough(
             model,
             X,
             traces,
-            max_neurons=max_neurons,
+            max_values=min(max_values, 20),
         )
-        result["figures"]["architecture"] = fig
 
+    def save_if_requested(fig: Any, filename: str) -> None:
         if save:
-            path = _asset_path(
-                asset_dir,
-                f"{prefix}_architecture",
-                "png",
-            )
+            path = _asset_path(asset_dir, f"{prefix}_{filename}", "png")
             result["assets"].append(str(_save_figure(fig, path)))
 
+    # Architecture
+    if "architecture" in requested:
+        if debug:
+            _debug_figure_explanation("architecture", model, X, traces)
+        fig = _architecture_figure(
+            model, X, traces, max_neurons=max_neurons
+        )
+        result["figures"]["architecture"] = fig
+        save_if_requested(fig, "architecture")
         plt.show()
 
     # Data flow
     if "data_flow" in requested:
+        if debug:
+            _debug_figure_explanation("data_flow", model, X, traces)
         fig = _data_flow_figure(
-            model,
-            X,
-            traces,
-            max_values=max_values,
+            model, X, traces, max_values=max_values
         )
         result["figures"]["data_flow"] = fig
-
-        if save:
-            path = _asset_path(
-                asset_dir,
-                f"{prefix}_data_flow",
-                "png",
-            )
-            result["assets"].append(str(_save_figure(fig, path)))
-
+        save_if_requested(fig, "data_flow")
         plt.show()
 
     # Activation statistics
     if "activations" in requested:
+        if debug:
+            _debug_figure_explanation("activations", model, X, traces)
         fig = _activations_figure(traces)
-
         if fig is not None:
             result["figures"]["activations"] = fig
-
-            if save:
-                path = _asset_path(
-                    asset_dir,
-                    f"{prefix}_activations",
-                    "png",
-                )
-                result["assets"].append(str(_save_figure(fig, path)))
-
+            save_if_requested(fig, "activations")
             plt.show()
 
     # Weight matrices
     if "weights" in requested:
+        if debug:
+            _debug_figure_explanation("weights", model, X, traces)
         figures = _weight_figures(model)
-        result["figures"]["weights"] = {
-            name: fig for name, fig in figures
-        }
-
+        result["figures"]["weights"] = dict(figures)
         for index, (name, fig) in enumerate(figures):
-            if save:
-                path = _asset_path(
-                    asset_dir,
-                    f"{prefix}_weights_{index}_{name}",
-                    "png",
-                )
-                result["assets"].append(str(_save_figure(fig, path)))
-
+            save_if_requested(fig, f"weights_{index}_{name}")
             plt.show()
 
-    # ReLU
+    # ReLU visualizations
     if "relu" in requested:
+        if debug:
+            _debug_figure_explanation("relu", model, X, traces)
         figures = _relu_figures(traces)
-        result["figures"]["relu"] = {
-            name: fig for name, fig in figures
-        }
-
+        result["figures"]["relu"] = dict(figures)
         for index, (name, fig) in enumerate(figures):
-            if save:
-                path = _asset_path(
-                    asset_dir,
-                    f"{prefix}_relu_{index}_{name}",
-                    "png",
-                )
-                result["assets"].append(str(_save_figure(fig, path)))
-
+            save_if_requested(fig, f"relu_{index}_{name}")
             plt.show()
 
     # One-neuron calculation
     if "neuron" in requested:
+        if debug:
+            _debug_figure_explanation("neuron", model, X, traces)
         fig = _neuron_detail_figure(
-            model,
-            traces,
-            layer=layer,
-            neuron=neuron_index,
+            model, traces, layer=layer, neuron=neuron_index
         )
         result["figures"]["neuron"] = fig
-
-        if save:
-            path = _asset_path(
-                asset_dir,
-                f"{prefix}_neuron_layer_{layer}_neuron_{neuron_index}",
-                "png",
-            )
-            result["assets"].append(str(_save_figure(fig, path)))
-
+        save_if_requested(
+            fig, f"neuron_layer_{layer}_neuron_{neuron_index}"
+        )
         plt.show()
 
     # Animation
     if "animation" in requested:
+        if debug:
+            _debug_figure_explanation("animation", model, X, traces)
         fig, anim = _animation(
             model,
             X,
@@ -1390,7 +1763,6 @@ def visualize_nn(
             interval=animation_interval,
             max_values=min(max_values, 60),
         )
-
         result["animations"]["data_flow"] = anim
 
         if save:
@@ -1401,15 +1773,43 @@ def visualize_nn(
             )
             result["assets"].append(str(_save_animation_html(anim, path)))
 
-        # In Jupyter, IPython's display system can render the HTML animation.
         try:
             from IPython.display import HTML, display
             display(HTML(anim.to_jshtml()))
         except ImportError:
-            # Outside Jupyter, keep the animation object available to caller.
             pass
 
         plt.close(fig)
+
+    if debug and not save:
+        _display_markdown(
+            """
+### Assets
+
+No files were written because `save=False`.
+
+To save every generated figure and the animation (when requested), use:
+
+```python
+visualize_nn(model, X, debug=True, animation=True, save=True)
+```
+"""
+        )
+
+    if save:
+        _display_markdown(
+            f"""
+### Assets
+
+Generated assets are saved under:
+
+`{Path(asset_dir).resolve()}`
+
+The returned dictionary also contains the exact generated file paths in:
+
+`result["assets"]`
+"""
+        )
 
     return result
 
