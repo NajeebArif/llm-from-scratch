@@ -1,4 +1,6 @@
+# Book Repository
 
+https://github.com/rasbt/LLMs-from-scratch
 
 ## Directory organization
 

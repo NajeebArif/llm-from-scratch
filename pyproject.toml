@@ -9,6 +9,7 @@ dependencies = [
     "ipykernel>=7.3.0",
     "matplotlib>=3.11.2",
     "numpy>=2.5.2",
+    "tiktoken>=0.14.0",
     "torch==2.14.0",
     "torchviz>=0.0.3",
 ]
